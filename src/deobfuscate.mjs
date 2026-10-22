@@ -601,9 +601,31 @@ async function main() {
   // Find all app JS files (exclude manifest.json, vendor/, and special non-module
   // files like runtime/main that contain Bun internals and must not be transformed)
   const SKIP_FILES = new Set(["00-runtime.js", "99-main.js"]);
+  const inputRoot = fs.realpathSync(dir);
   const allFiles = fs
     .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".js") && !SKIP_FILES.has(entry.name))
+    .filter((entry) => entry.name.endsWith(".js") && !SKIP_FILES.has(entry.name))
+    .filter((entry) => {
+      if (entry.isFile()) return true;
+      if (!entry.isSymbolicLink()) return false;
+
+      // Preserve file symlinks without allowing transformations to write outside
+      // the input directory. Validate every candidate before running any stage.
+      let target;
+      try {
+        target = fs.realpathSync(path.join(dir, entry.name));
+      } catch (err) {
+        throw new Error(`Input symlink cannot resolve target: ${entry.name}: ${err.message}`);
+      }
+      const relative = path.relative(inputRoot, target);
+      if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw new Error(`Input symlink escapes input directory: ${entry.name}`);
+      }
+      if (!fs.statSync(target).isFile()) {
+        throw new Error(`Input symlink target is not a regular file: ${entry.name}`);
+      }
+      return true;
+    })
     .map((entry) => entry.name)
     .sort();
 

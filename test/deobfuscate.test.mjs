@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -179,3 +182,106 @@ test("prettier ignores directories ending in .js and preserves runtime files", (
   assert.equal(result.status, 0, result.stderr);
   assert.equal(readFileSync(join(dir, "00-runtime.js"), "utf8"), "var runtime=1;");
 });
+
+for (const [stage, source, expected] of [
+  ["prettier", "var a=1;console.log(a);", "var a = 1;\nconsole.log(a);\n"],
+  ["wakaru", "var a = !0;", /var a = true;/],
+  ["lebab", "var a = function () { return 1; };", /var a = \(\) => 1;/],
+]) {
+  test(`${stage} transforms contained regular-file symlink inputs`, (t) => {
+    const { dir } = fixture(t);
+    const input = join(dir, "0001.js");
+    const target = join(dir, "source.txt");
+    rmSync(input);
+    writeFileSync(target, source);
+    symlinkSync("source.txt", input, "file");
+
+    const result = cli(["--dir", dir, "--only", stage]);
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Deobfuscation pipeline: 1 app files/);
+    const transformed = readFileSync(target, "utf8");
+    if (typeof expected === "string") assert.equal(transformed, expected);
+    else assert.match(transformed, expected);
+    assert.equal(lstatSync(input).isSymbolicLink(), true);
+    assert.equal(readlinkSync(input), "source.txt");
+  });
+}
+
+test("prettier accepts chained contained symlinks through a symlinked input directory", (t) => {
+  const { root, dir } = fixture(t);
+  const input = join(dir, "0001.js");
+  const target = join(dir, "nested", "source.txt");
+  const alias = join(root, "decoded-link");
+  mkdirSync(join(dir, "nested"));
+  rmSync(input);
+  writeFileSync(target, "var a=1;");
+  symlinkSync(target, join(dir, "source-link"), "file");
+  symlinkSync("source-link", input, "file");
+  symlinkSync(dir, alias, "junction");
+  for (const name of ["00-runtime.js", "99-main.js"]) {
+    writeFileSync(join(dir, `${name}.txt`), "var runtime=1;");
+    symlinkSync(`${name}.txt`, join(dir, name), "file");
+  }
+
+  const result = cli(["--dir", alias, "--only", "prettier"]);
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Deobfuscation pipeline: 1 app files/);
+  assert.equal(readFileSync(target, "utf8"), "var a = 1;\n");
+  assert.equal(readlinkSync(input), "source-link");
+  for (const name of ["00-runtime.js", "99-main.js"]) {
+    assert.equal(readFileSync(join(dir, `${name}.txt`), "utf8"), "var runtime=1;");
+  }
+});
+
+for (const kind of [
+  "relative escape",
+  "absolute escape",
+  "chained escape",
+  "missing",
+  "directory",
+  "fifo",
+]) {
+  test(
+    `discovery rejects a symlink with a ${kind} target before changing files`,
+    { skip: kind === "fifo" && process.platform === "win32" },
+    (t) => {
+      const { root, dir } = fixture(t);
+      const source = "var a=1;";
+      writeFileSync(join(dir, "0001.js"), source);
+      const outside = join(root, "decoded-outside");
+      mkdirSync(outside);
+      const outsideFile = join(outside, "source.txt");
+      writeFileSync(outsideFile, source);
+      let target;
+      if (kind === "relative escape") target = "../decoded-outside/source.txt";
+      else if (kind === "absolute escape") target = outsideFile;
+      else if (kind === "chained escape") {
+        symlinkSync(outside, join(dir, "bridge"), "junction");
+        target = "bridge/source.txt";
+      } else if (kind === "missing") target = "missing.txt";
+      else if (kind === "directory") {
+        mkdirSync(join(dir, "assets"));
+        target = "assets";
+      } else {
+        target = "pipe";
+        const fifo = spawnSync("mkfifo", [join(dir, target)], { encoding: "utf8" });
+        assert.equal(fifo.status, 0, fifo.stderr);
+      }
+      const input = join(dir, "0002.js");
+      symlinkSync(target, input, kind === "directory" ? "dir" : "file");
+
+      for (const stage of ["wakaru", "lebab", "prettier"]) {
+        const result = cli(["--dir", dir, "--only", stage]);
+        assert.equal(result.error, undefined);
+        assert.notEqual(result.status, 0, result.stdout);
+        assert.match(result.stderr, /symlink.*(escapes|resolve|regular file)/i);
+        assert.equal(readFileSync(join(dir, "0001.js"), "utf8"), source);
+        assert.equal(readFileSync(outsideFile, "utf8"), source);
+        assert.equal(readlinkSync(input), target);
+        assert.equal(existsSync(join(dir, "missing.txt")), false);
+      }
+    },
+  );
+}

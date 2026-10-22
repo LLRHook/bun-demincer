@@ -168,6 +168,8 @@ The fingerprint DB (`data/vendor-fingerprints-1000.json`, 26MB) covers 23,746 fi
 
 Runtime files (`00-runtime.js`, `99-main.js`) are automatically excluded from wakaru/lebab/prettier. Identifiers declared in runtime files (Bun's module system globals like `h`, `v`, `y`, `MR`) are auto-excluded from renames — they're referenced by all modules including vendor.
 
+App `.js` symlinks are supported when their resolved targets are regular files inside the input directory. Escaping, missing, or nonregular symlink targets cause discovery to fail before any stage changes files. Directories ending in `.js` are ignored.
+
 ### Name recovery
 
 Bun's `__export()` pattern — `MR(target, { exportName: () => minifiedVar })` — preserves original export names as string keys. This is the single biggest source of name recovery. Additional patterns: `this.name = "X"` in class constructors, `displayName = "X"` assignments, and 20+ mapped Bun runtime helpers.
