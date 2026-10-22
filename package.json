@@ -1,6 +1,9 @@
 {
   "name": "bun-demincer",
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "@babel/generator": "^7.26.0",
     "@babel/parser": "^7.26.0",

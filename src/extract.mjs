@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
-import { join, dirname } from "path";
+import { readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync } from "fs";
+import { join, dirname, relative, sep } from "path";
 
 const TRAILER = "\n---- Bun! ----\n";
 const SECTION_HEADER_SIZE = 8; // u64 size header in __BUN Mach-O section
@@ -129,15 +129,65 @@ for (let i = 0; i < numModules; i++) {
 // --- Step 6: Extract files ---
 console.log(`\nExtracting to ${outDir}/...`);
 
+// Plan and validate every destination before writing any module. Embedded names
+// are untrusted, and source maps must not overwrite modules or the manifest.
+const outputRoot = realpathSync(outDir);
+const manifestPath = join(outputRoot, "manifest.json");
+const outputPaths = new Set([manifestPath]);
+function planOutput(relPath) {
+  const normalized = relPath.replace(/\\/g, "/");
+  if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) ||
+      normalized.includes("\0") || normalized.split("/").includes("..")) {
+    throw new Error(`Invalid embedded file path: ${JSON.stringify(relPath)}`);
+  }
+  const output = join(outputRoot, normalized);
+  if (output === outputRoot || outputPaths.has(output)) {
+    throw new Error(`Output path collision or reserved path: ${JSON.stringify(relPath)}`);
+  }
+  outputPaths.add(output);
+  return output;
+}
+
+for (const mod of modules) {
+  if (mod.contLen === 0) continue;
+  mod.relPath = mod.name
+    .replace(/^\/\$bunfs\/root\//, "")
+    .replace(/^\$bunfs\/root\//, "");
+  mod.outPath = planOutput(mod.relPath);
+  if (mod.smapLen > 0) {
+    mod.smapPath = planOutput(relative(outputRoot, mod.outPath) + ".map");
+  }
+}
+
+for (const output of outputPaths) {
+  const parts = relative(outputRoot, output).split(sep);
+  let current = outputRoot;
+  for (const [index, part] of parts.entries()) {
+    current = join(current, part);
+    const isParent = index < parts.length - 1;
+    if (isParent && outputPaths.has(current)) {
+      throw new Error(`Conflicting output file and directory path: ${current}`);
+    }
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch (err) {
+      if (err.code === "ENOENT") continue;
+      throw err;
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Refusing to extract through a symbolic link: ${current}`);
+    }
+    if (isParent ? !stat.isDirectory() : !stat.isFile()) {
+      throw new Error(`Invalid output file or directory path: ${current}`);
+    }
+  }
+}
+
 for (const mod of modules) {
   if (mod.contLen === 0) continue;
 
-  // Create path structure
-  let relPath = mod.name
-    .replace(/^\/\$bunfs\/root\//, "")
-    .replace(/^\$bunfs\/root\//, "");
-
-  const outPath = join(outDir, relPath);
+  const { relPath, outPath } = mod;
   const dir = dirname(outPath);
   mkdirSync(dir, { recursive: true });
 
@@ -153,7 +203,7 @@ for (const mod of modules) {
   // Extract sourcemap if present
   if (mod.smapLen > 0) {
     const smap = buf.subarray(dataStart + mod.smapOff, dataStart + mod.smapOff + mod.smapLen);
-    writeFileSync(outPath + ".map", smap);
+    writeFileSync(mod.smapPath, smap);
     console.log(`  ${relPath}.map (${(mod.smapLen/1024).toFixed(1)}KB)`);
   }
 }
@@ -177,6 +227,6 @@ const manifest = {
     side: m.side,
   }))
 };
-writeFileSync(join(outDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 console.log(`\nManifest: ${outDir}/manifest.json`);
 console.log("Done!");

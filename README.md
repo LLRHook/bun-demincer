@@ -62,6 +62,8 @@ node src/organize.mjs decoded/
 
 Steps 1-4 are fully automated. Steps 5-8 organize the output into directories — step 7 requires manual labeling (or an LLM).
 
+Extraction validates embedded filenames and source-map destinations before writing modules. It rejects paths outside the output directory, conflicting destinations, and existing symbolic links beneath that directory.
+
 ### Round-trip: reassemble and run
 
 After deobfuscating (and optionally modifying) individual module files, reassemble them back into a working binary:
@@ -75,6 +77,14 @@ cd <version-dir>/extracted && bun run.js --version
 ```
 
 The `--no-bun-cjs` flag wraps the code as a self-executing IIFE instead of relying on Bun's strict `@bun-cjs` CJS loader, which requires byte-exact formatting incompatible with any code transformation.
+
+The splitter also has a built-in reassembler for restoring the original Bun CJS wrapper:
+
+```bash
+node src/resplit.mjs --reassemble decoded/ reassembled.js
+```
+
+Every file in the manifest's `sourceOrder` must exist inside the split directory. Missing files, malformed entries, and paths that escape that directory cause reassembly to fail before replacing the output bundle.
 
 ### With AI-assisted renaming (optional, improves readability)
 
@@ -106,6 +116,15 @@ node src/apply-reference-layout.mjs new-decoded/ --reference old-decoded-organiz
 
 - **Node.js** (v18+)
 - **Bun** (optional — only needed to *run* the extracted code, not to decompile it)
+
+## Development
+
+```bash
+npm ci
+npm test
+```
+
+The regression suite uses Node's built-in test runner, synthetic binary fixtures, and synthetic bundles. It covers extraction paths, CLI validation, literal filenames in subprocesses, temporary-file cleanup, and executable split/deobfuscate/reassemble round trips without calling AI APIs.
 
 ## How it works
 
