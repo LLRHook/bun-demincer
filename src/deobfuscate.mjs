@@ -25,8 +25,9 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { createRequire } from "module";
+import { tmpdir } from "os";
 
 const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
@@ -37,6 +38,8 @@ const __dirname = path.dirname(__filename);
 const { runTransformationRules } = require("@wakaru/unminify");
 
 // ── Argument parsing ──────────────────────────────────────────────
+
+const STAGES = ["wakaru", "lebab", "extract", "extract-names", "rename", "prettier"];
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -51,32 +54,39 @@ function parseArgs() {
   };
 
   let i = 0;
+  function takeValue() {
+    const option = args[i++];
+    const value = args[i++];
+    if (value === undefined || value.length === 0 || value.startsWith("--") || value === "-h") {
+      throw new Error(`${option} requires a value`);
+    }
+    return value;
+  }
   while (i < args.length) {
     switch (args[i]) {
       case "--dir":
-        opts.dir = args[++i];
-        i++;
+        opts.dir = takeValue();
         break;
       case "--batch":
-        opts.batch.push(args[++i]);
-        i++;
+        opts.batch.push(path.resolve(takeValue()));
         break;
       case "--skip":
-        opts.skip.add(args[++i]);
-        i++;
+        opts.skip.add(takeValue());
         break;
       case "--only":
-        opts.only = args[++i];
-        i++;
+        opts.only = takeValue();
         break;
       case "--manifest":
-        opts.manifest = args[++i];
-        i++;
+        opts.manifest = takeValue();
         break;
-      case "--concurrency":
-        opts.concurrency = parseInt(args[++i], 10);
-        i++;
+      case "--concurrency": {
+        const value = takeValue();
+        opts.concurrency = Number(value);
+        if (!/^\d+$/.test(value) || !Number.isSafeInteger(opts.concurrency) || opts.concurrency < 1) {
+          throw new Error("--concurrency must be a positive safe integer");
+        }
         break;
+      }
       case "--help":
       case "-h":
         printUsage();
@@ -85,6 +95,12 @@ function parseArgs() {
         console.error(`Unknown option: ${args[i]}`);
         printUsage();
         process.exit(1);
+    }
+  }
+
+  for (const stage of [...opts.skip, ...(opts.only ? [opts.only] : [])]) {
+    if (!STAGES.includes(stage)) {
+      throw new Error(`Unknown stage: ${stage}. Expected one of: ${STAGES.join(", ")}`);
     }
   }
 
@@ -276,15 +292,16 @@ function stageLebab(dir, files) {
 
 // ── Stage 3: extract-exports (auto-rename map) ──────────────────
 
-function stageExtract(dir) {
+function stageExtract(dir, tempDir) {
   console.log("\n━━━ Stage 3: extract (auto-rename from MR() exports) ━━━");
 
   const extractMjs = path.join(__dirname, "extract-exports.mjs");
-  const outFile = path.join(dir, ".auto-renames.json");
+  const outFile = path.join(tempDir, "auto-renames.json");
 
   try {
-    const result = execSync(
-      `node "${extractMjs}" "${dir}" --out "${outFile}" --stats`,
+    execFileSync(
+      process.execPath,
+      [extractMjs, dir, "--out", outFile, "--stats"],
       {
         cwd: __dirname,
         stdio: ["pipe", "pipe", "pipe"],
@@ -318,22 +335,21 @@ function stageExtract(dir) {
 
 // ── Stage 3b: extract-names (this.name/displayName patterns) ─────
 
-function stageExtractNames(dir, existingBatchFiles) {
+function stageExtractNames(dir, existingBatchFiles, tempDir) {
   console.log("\n━━━ Stage 3b: extract-names (this.name/displayName patterns) ━━━");
 
   const extractNamesMjs = path.join(__dirname, "extract-names.mjs");
-  const outFile = path.join(dir, ".auto-names.json");
+  const outFile = path.join(tempDir, "auto-names.json");
 
   // Build --exclude-existing args from all batch files collected so far
   const excludeArgs = existingBatchFiles
-    .filter((f) => fs.existsSync(f))
-    .map((f) => `"${f}"`)
-    .join(" ");
-  const excludeFlag = excludeArgs ? `--exclude-existing ${excludeArgs}` : "";
+    .filter((f) => fs.existsSync(f));
 
   try {
-    execSync(
-      `node "${extractNamesMjs}" "${dir}" --out "${outFile}" --stats ${excludeFlag}`,
+    execFileSync(
+      process.execPath,
+      [extractNamesMjs, dir, "--out", outFile, "--stats",
+        ...(excludeArgs.length ? ["--exclude-existing", ...excludeArgs] : [])],
       {
         cwd: __dirname,
         stdio: ["pipe", "pipe", "pipe"],
@@ -401,7 +417,7 @@ function extractRuntimeIdentifiers(filePath) {
   return ids;
 }
 
-function stageRename(dir, batchFiles, manifestPath, skipFiles) {
+function stageRename(dir, batchFiles, manifestPath, skipFiles, tempDir) {
   console.log("\n━━━ Stage 4: rename (AST identifier rename) ━━━");
 
   if (!batchFiles || batchFiles.length === 0) {
@@ -456,13 +472,14 @@ function stageRename(dir, batchFiles, manifestPath, skipFiles) {
   }
 
   // Write merged renames to temp file
-  const tmpBatch = path.join(dir, ".rename-batch-tmp.json");
+  const tmpBatch = path.join(tempDir, "rename-batch.json");
   fs.writeFileSync(tmpBatch, JSON.stringify(merged, null, 2));
 
-  const manifestFlag = manifestPath ? ` --manifest "${manifestPath}"` : "";
   try {
-    const output = execSync(
-      `node "${renameMjs}" --batch "${tmpBatch}" --dir "${dir}"${manifestFlag} --smart`,
+    const output = execFileSync(
+      process.execPath,
+      [renameMjs, "--batch", tmpBatch, "--dir", dir,
+        ...(manifestPath ? ["--manifest", manifestPath] : []), "--smart"],
       {
         cwd: __dirname,
         stdio: ["pipe", "pipe", "pipe"],
@@ -584,9 +601,32 @@ async function main() {
   // Find all app JS files (exclude manifest.json, vendor/, and special non-module
   // files like runtime/main that contain Bun internals and must not be transformed)
   const SKIP_FILES = new Set(["00-runtime.js", "99-main.js"]);
+  const inputRoot = fs.realpathSync(dir);
   const allFiles = fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith(".js") && !SKIP_FILES.has(f))
+    .readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.name.endsWith(".js") && !SKIP_FILES.has(entry.name))
+    .filter((entry) => {
+      if (entry.isFile()) return true;
+      if (!entry.isSymbolicLink()) return false;
+
+      // Preserve file symlinks without allowing transformations to write outside
+      // the input directory. Validate every candidate before running any stage.
+      let target;
+      try {
+        target = fs.realpathSync(path.join(dir, entry.name));
+      } catch (err) {
+        throw new Error(`Input symlink cannot resolve target: ${entry.name}: ${err.message}`);
+      }
+      const relative = path.relative(inputRoot, target);
+      if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw new Error(`Input symlink escapes input directory: ${entry.name}`);
+      }
+      if (!fs.statSync(target).isFile()) {
+        throw new Error(`Input symlink target is not a regular file: ${entry.name}`);
+      }
+      return true;
+    })
+    .map((entry) => entry.name)
     .sort();
 
   const vendorDir = path.join(dir, "vendor");
@@ -601,66 +641,50 @@ async function main() {
       : "")
   );
 
-  const stages = ["wakaru", "lebab", "extract", "extract-names", "rename", "prettier"];
   const activeStages = opts.only
-    ? stages.filter((s) => s === opts.only)
-    : stages.filter((s) => !opts.skip.has(s));
+    ? STAGES.filter((s) => s === opts.only)
+    : STAGES.filter((s) => !opts.skip.has(s));
 
   console.log(`Active stages: ${activeStages.join(" → ")}`);
 
   const startTime = Date.now();
-  let autoRenamesFile = null; // track for cleanup after rename
-  let autoNamesFile = null;   // track for cleanup after rename
+  // Keep each run's intermediate maps separate from user files and concurrent
+  // runs, and remove them even when a later stage fails.
+  const tempDir = fs.mkdtempSync(path.join(tmpdir(), "bun-demincer-"));
+  try {
+    for (const stage of activeStages) {
+      const stageStart = Date.now();
 
-  for (const stage of activeStages) {
-    const stageStart = Date.now();
+      switch (stage) {
+        case "wakaru":
+          await stageWakaru(dir, allFiles, opts.concurrency);
+          break;
+        case "lebab":
+          stageLebab(dir, allFiles);
+          break;
+        case "extract": {
+          const autoRenamesFile = stageExtract(dir, tempDir);
+          if (autoRenamesFile) opts.batch.push(autoRenamesFile);
+          break;
+        }
+        case "extract-names": {
+          const autoNamesFile = stageExtractNames(dir, opts.batch, tempDir);
+          if (autoNamesFile) opts.batch.push(autoNamesFile);
+          break;
+        }
+        case "rename":
+          stageRename(dir, opts.batch, manifestPath, SKIP_FILES, tempDir);
+          break;
+        case "prettier":
+          await stagePrettier(dir, allFiles);
+          break;
+      }
 
-    switch (stage) {
-      case "wakaru":
-        await stageWakaru(dir, allFiles, opts.concurrency);
-        break;
-      case "lebab":
-        stageLebab(dir, allFiles);
-        break;
-      case "extract":
-        autoRenamesFile = stageExtract(dir);
-        if (autoRenamesFile) {
-          opts.batch.push(autoRenamesFile);
-        }
-        break;
-      case "extract-names":
-        autoNamesFile = stageExtractNames(dir, opts.batch);
-        if (autoNamesFile) {
-          opts.batch.push(autoNamesFile);
-        }
-        break;
-      case "rename":
-        stageRename(dir, opts.batch, manifestPath, SKIP_FILES);
-        // Clean up auto-generated renames files
-        if (autoRenamesFile) {
-          fs.rmSync(autoRenamesFile, { force: true });
-          autoRenamesFile = null;
-        }
-        if (autoNamesFile) {
-          fs.rmSync(autoNamesFile, { force: true });
-          autoNamesFile = null;
-        }
-        break;
-      case "prettier":
-        await stagePrettier(dir, allFiles);
-        break;
+      const elapsed = ((Date.now() - stageStart) / 1000).toFixed(1);
+      console.log(`  (${elapsed}s)`);
     }
-
-    const elapsed = ((Date.now() - stageStart) / 1000).toFixed(1);
-    console.log(`  (${elapsed}s)`);
-  }
-
-  // Final cleanup in case rename was skipped but extract ran
-  if (autoRenamesFile && fs.existsSync(autoRenamesFile)) {
-    fs.rmSync(autoRenamesFile, { force: true });
-  }
-  if (autoNamesFile && fs.existsSync(autoNamesFile)) {
-    fs.rmSync(autoNamesFile, { force: true });
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 
   const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);

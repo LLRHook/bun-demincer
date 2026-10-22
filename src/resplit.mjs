@@ -24,19 +24,24 @@
  *     manifest.json            # metadata, module index, vendor mapping
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
-import { join, dirname } from "path";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, statSync } from "fs";
+import { join, relative, isAbsolute, sep } from "path";
 
 // ─── Reassembly mode ────────────────────────────────────────────────────────
 
 if (process.argv[2] === "--reassemble") {
   const splitDir = process.argv[3];
-  const outFile = process.argv[4] || join(splitDir, "..", "reassembled.js");
   if (!splitDir) {
     console.error("Usage: node resplit.mjs --reassemble <resplit-dir> [output-file]");
     process.exit(1);
   }
-  reassemble(splitDir, outFile);
+  const outFile = process.argv[4] || join(splitDir, "..", "reassembled.js");
+  try {
+    reassemble(splitDir, outFile);
+  } catch (err) {
+    console.error(`Reassembly failed: ${err.message}`);
+    process.exit(1);
+  }
   process.exit(0);
 }
 
@@ -47,20 +52,45 @@ function reassemble(splitDir, outFile) {
     process.exit(1);
   }
   const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
-  const sourceOrder = manifest.sourceOrder;
-  if (!sourceOrder || sourceOrder.length === 0) {
-    console.error("manifest.json has no sourceOrder");
-    process.exit(1);
+  const sourceOrder = manifest?.sourceOrder;
+  if (!Array.isArray(sourceOrder) || sourceOrder.length === 0) {
+    throw new Error("manifest.json sourceOrder must be a non-empty array");
+  }
+  for (const [index, entry] of sourceOrder.entries()) {
+    if (!entry || !["runtime", "module", "main"].includes(entry.type) ||
+        typeof entry.file !== "string" || entry.file.length === 0) {
+      throw new Error(`Invalid sourceOrder entry at index ${index}: expected a type and file path`);
+    }
   }
 
   console.log(`Reassembling from ${splitDir}...`);
 
   // All modules (app + vendor) are individual files — read and strip header.
+  const root = realpathSync(splitDir);
   const fileCache = new Map();
   function readFile(filename) {
     if (!fileCache.has(filename)) {
-      const p = join(splitDir, filename);
-      fileCache.set(filename, existsSync(p) ? readFileSync(p, "utf-8") : "");
+      // Manifests use relative paths. Check both separator styles so a manifest
+      // cannot escape its directory when moved between Windows and POSIX.
+      const normalized = filename.replace(/\\/g, "/");
+      if (normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) ||
+          normalized.split("/").includes("..") || normalized.includes("\0")) {
+        throw new Error(`Invalid source file path: ${JSON.stringify(filename)} (must be relative)`);
+      }
+      let p;
+      try {
+        p = realpathSync(join(root, normalized));
+      } catch (err) {
+        throw new Error(`Cannot read source file ${JSON.stringify(filename)}: ${err.message}`);
+      }
+      const fromRoot = relative(root, p);
+      if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+        throw new Error(`Source file path escapes split directory: ${JSON.stringify(filename)}`);
+      }
+      if (!statSync(p).isFile()) {
+        throw new Error(`Source file path is not a regular file: ${JSON.stringify(filename)}`);
+      }
+      fileCache.set(filename, readFileSync(p, "utf-8"));
     }
     return fileCache.get(filename);
   }
@@ -383,7 +413,7 @@ console.log(`  ${modIdx - 1} module files written`);
 
 // 10e: Write trailing code (main execution)
 const lastEnd =
-  modules.length > 0 ? modules[modules.length - 1].endPos : 0;
+  modules.length > 0 ? modules[modules.length - 1].endPos : code.length;
 const trailing = code.slice(lastEnd).trim();
 if (trailing.length > 0) {
   writeFileSync(join(outDir, "99-main.js"), trailing);
